@@ -15,8 +15,23 @@ install_extensions() {
     cd ../../
 }
 
+install_user_extensions() {
+    local args=("$@")
+    local i=0
+    while [ $i -lt ${#args[@]} ]; do
+        if [ "${args[$i]}" = "--extension" ] && [ $((i + 1)) -lt ${#args[@]} ]; then
+            local ext_path="${args[$((i + 1))]}"
+            if [ -f "$ext_path/setup.py" ] || [ -f "$ext_path/pyproject.toml" ]; then
+                echo "Installing extension from $ext_path"
+                pip install -e "$ext_path"
+            fi
+        fi
+        i=$((i + 1))
+    done
+}
+
 run_tests() {
-  cd test/core && PYTHONPATH=`pwd`/../../ python3 run_tests.py --num-parallel 8 && cd ../../
+  cd test/core && PYTHONPATH=`pwd`/../../ python3 run_tests.py --num-parallel 8 "$@" && cd ../../
 }
 
 # We run realtime cards tests separately because there these tests validate the asynchronous updates to the
@@ -27,4 +42,4 @@ run_runtime_card_tests() {
   cd test/core && PYTHONPATH=`pwd`/../../ python3 run_tests.py --num-parallel 8 --contexts python3-all-local-cards-realtime --graphs $CARD_GRAPHS && cd ../../
 }
 
-install_deps && install_extensions && run_tests && run_runtime_card_tests
+install_deps && install_extensions && install_user_extensions "$@" && run_tests "$@" && run_runtime_card_tests

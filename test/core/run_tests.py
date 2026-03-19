@@ -38,20 +38,28 @@ def iter_graphs():
                 yield json.load(f)
 
 
-def iter_tests():
-    root = os.path.join(os.path.dirname(__file__), "tests")
-    sys.path.insert(0, root)
-    for testfile in os.listdir(root):
-        if testfile.endswith(".py") and not testfile[0] == ".":
-            mod = importlib.import_module(testfile[:-3], "metaflow_test")
-            for name in dir(mod):
-                obj = getattr(mod, name)
-                if (
-                    name != "MetaflowTest"
-                    and isinstance(obj, type)
-                    and issubclass(obj, MetaflowTest)
-                ):
-                    yield obj()
+def iter_tests(ext_dirs=None):
+    roots = [os.path.join(os.path.dirname(__file__), "tests")]
+    for ext_dir in (ext_dirs or []):
+        mf_ext = os.path.join(ext_dir, "metaflow_extensions")
+        if os.path.isdir(mf_ext):
+            for org in os.listdir(mf_ext):
+                core_tests = os.path.join(mf_ext, org, "core_tests", "tests")
+                if os.path.isdir(core_tests):
+                    roots.append(core_tests)
+    for root in roots:
+        sys.path.insert(0, root)
+        for testfile in os.listdir(root):
+            if testfile.endswith(".py") and not testfile[0] == ".":
+                mod = importlib.import_module(testfile[:-3], "metaflow_test")
+                for name in dir(mod):
+                    obj = getattr(mod, name)
+                    if (
+                        name != "MetaflowTest"
+                        and isinstance(obj, type)
+                        and issubclass(obj, MetaflowTest)
+                    ):
+                        yield obj()
 
 
 _log_lock = threading.Lock()
@@ -92,7 +100,7 @@ def log(
                 click.echo(p.stderr, nl=False)
 
 
-def run_test(formatter, context, debug, checks, env_base, executor):
+def run_test(formatter, context, debug, checks, env_base, executor, ext_dirs=None):
     def run_cmd(mode, args=None):
         cmd = [context["python"], "-B", "test_flow.py"]
         cmd.extend(context["top_options"])
@@ -195,13 +203,16 @@ def run_test(formatter, context, debug, checks, env_base, executor):
             )
 
             pythonpath = os.environ.get("PYTHONPATH", ".")
+            ext_pythonpath = ""
+            for ext_dir in (ext_dirs or []):
+                ext_pythonpath += ":" + ext_dir
             env.update(
                 {
                     "LANG": "en_US.UTF-8",
                     "LC_ALL": "en_US.UTF-8",
                     "PATH": os.environ.get("PATH", "."),
                     "PYTHONIOENCODING": "utf_8",
-                    "PYTHONPATH": "%s:%s" % (package, pythonpath),
+                    "PYTHONPATH": "%s%s:%s" % (package, ext_pythonpath, pythonpath),
                 }
             )
 
@@ -367,10 +378,22 @@ def run_test(formatter, context, debug, checks, env_base, executor):
             shutil.rmtree(tempdir)
 
 
-def run_all(ok_tests, ok_contexts, ok_graphs, debug, num_parallel, inherit_env):
+def run_all(
+    ok_tests,
+    ok_contexts,
+    ok_graphs,
+    debug,
+    num_parallel,
+    inherit_env,
+    ext_dirs=None,
+    include_extension_tests=False,
+):
     tests = [
         test
-        for test in sorted(iter_tests(), key=lambda x: x.PRIORITY)
+        for test in sorted(
+            iter_tests(ext_dirs=ext_dirs if include_extension_tests else None),
+            key=lambda x: x.PRIORITY,
+        )
         if not ok_tests or test.__class__.__name__.lower() in ok_tests
     ]
     failed = []
@@ -383,17 +406,21 @@ def run_all(ok_tests, ok_contexts, ok_graphs, debug, num_parallel, inherit_env):
     if debug or num_parallel is None:
         for test in tests:
             failed.extend(
-                run_test_cases((test, ok_contexts, ok_graphs, debug, base_env))
+                run_test_cases(
+                    (test, ok_contexts, ok_graphs, debug, base_env, ext_dirs)
+                )
             )
     else:
-        args = [(test, ok_contexts, ok_graphs, debug, base_env) for test in tests]
+        args = [
+            (test, ok_contexts, ok_graphs, debug, base_env, ext_dirs) for test in tests
+        ]
         for fail in Pool(num_parallel).imap_unordered(run_test_cases, args):
             failed.extend(fail)
     return failed
 
 
 def run_test_cases(args):
-    test, ok_contexts, ok_graphs, debug, base_env = args
+    test, ok_contexts, ok_graphs, debug, base_env, ext_dirs = args
     contexts = json.load(open("contexts.json"))
     graphs = list(iter_graphs())
     test_name = test.__class__.__name__
@@ -438,6 +465,7 @@ def run_test_cases(args):
                         contexts["checks"],
                         base_env,
                         executor,
+                        ext_dirs=ext_dirs,
                     )
 
                     if ret:
@@ -502,6 +530,20 @@ def run_test_cases(args):
     type=int,
     help="Number of parallel tests to run. By default, " "tests are run sequentially.",
 )
+@click.option(
+    "--extension",
+    multiple=True,
+    type=str,
+    help="Path to an extension directory to include in test runs. "
+    "Can be specified multiple times.",
+)
+@click.option(
+    "--include-extension-tests",
+    is_flag=True,
+    default=False,
+    help="Also discover and run tests provided by extensions "
+    "(from metaflow_extensions/<org>/core_tests/tests/).",
+)
 def cli(
     tests=None,
     contexts=None,
@@ -509,8 +551,21 @@ def cli(
     num_parallel=None,
     debug=False,
     inherit_env=False,
+    extension=None,
+    include_extension_tests=False,
 ):
     parse = lambda x: {t.lower() for t in x.split(",") if t}
+
+    ext_dirs = []
+    for ext_path in (extension or []):
+        abs_path = os.path.abspath(ext_path)
+        if not os.path.isdir(abs_path):
+            log("Extension path does not exist: %s" % abs_path, real_bad=True)
+            sys.exit(1)
+        ext_dirs.append(abs_path)
+
+    if ext_dirs:
+        log("Testing with extensions: %s" % ", ".join(ext_dirs))
 
     failed = run_all(
         parse(tests),
@@ -519,6 +574,8 @@ def cli(
         debug,
         num_parallel,
         inherit_env,
+        ext_dirs=ext_dirs,
+        include_extension_tests=include_extension_tests,
     )
 
     if failed:
